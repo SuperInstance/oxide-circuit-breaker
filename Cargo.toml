@@ -1,0 +1,7 @@
+[package]
+name = "oxide-circuit-breaker"
+version = "0.1.0"
+edition = "2021"
+description = "Circuit breaker pattern for GPU kernels. Track success/failure rates, trip on threshold, reroute to fallback. Ternary state: Closed/Open/HalfOpen with CRDT sync across GPU nodes."
+license = "Apache-2.0"
+repository = "https://github.com/SuperInstance/oxide-circuit-breaker"
