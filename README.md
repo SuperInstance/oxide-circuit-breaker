@@ -1,131 +1,152 @@
 # oxide-circuit-breaker
 
-> Ternary-state circuit breakers for GPU kernels, with CRDT-synchronized fleet awareness.
+> A production-grade circuit breaker for GPU kernels, built in Rust. Protect your inference fleet from cascading failures with ternary-state semantics, automatic fallback routing, and CRDT-based fleet-wide synchronization.
 
-## Background Theory
+---
 
-GPU kernels fail in ways that differ from traditional microservices. A kernel may segfault on one input shape but not another. A memory access pattern may be correct on an A100 but trigger an illegal instruction on a V100. A driver update may introduce latency spikes that look like failures under tight deadlines. Naive retry logic under these conditions can generate thundering herds that saturate already-struggling nodes.
+## The Story: Why GPUs Need Circuit Breakers
 
-The circuit breaker pattern, introduced in distributed systems to prevent cascading failure, maps elegantly onto GPU kernel health:
+Modern AI workloads run on fleets of accelerators—dozens, hundreds, or thousands of GPUs crunching through attention layers, reductions, and custom kernels in parallel. When one kernel starts failing—whether from a driver bug, a memory corruption, or a thermal throttle—the default behavior is to retry. And retry. And retry again. Each failed attempt wastes precious PCIe bandwidth, SM occupancy, and power. Worse, in a distributed setting, a sick node can poison the entire fleet as healthy nodes block waiting for stragglers.
 
-- **Closed**: The kernel is healthy; calls execute normally.
-- **Open**: The kernel has failed repeatedly; calls are rejected or routed to a fallback.
-- **HalfOpen**: A probing window where a small number of calls are allowed to test recovery.
+The [circuit breaker pattern](https://martinfowler.com/bliki/CircuitBreaker.html), popularized in microservices, is just as essential at the kernel layer. `oxide-circuit-breaker` brings that resilience pattern directly into the GPU compute path. It tracks the health of individual kernels, trips open when failure thresholds are crossed, reroutes traffic to fallback implementations, and—critically—coordinates state across the entire fleet using conflict-free replicated data types (CRDTs) so that every node learns from every other node's experience.
 
-`oxide-circuit-breaker` extends this classic pattern in two ways. First, it encodes the three states as a **ternary logic** that mirrors the SuperInstance `{-1, 0, +1}` motif: Open, HalfOpen, Closed correspond naturally to negative, neutral/uncertain, and positive. Second, it propagates breaker state across the fleet via a **CRDT merge**, so that a kernel failure observed on one GPU node can protect the entire fleet.
+This crate is part of the broader [SuperInstance](https://github.com/SuperInstance/SuperInstance) ecosystem, a collection of Rust libraries for building resilient, high-performance GPU infrastructure.
 
-## How It Works
+---
 
-### KernelBreaker
+## Ternary-State Semantics
 
-A `KernelBreaker` tracks the health of a single named kernel:
+The breaker moves through three distinct states. Understanding them is the key to using the library effectively.
 
-- `success_count` and `failure_count` record lifetime statistics.
-- `consecutive_failures` drives the trip condition.
-- `threshold` is the number of consecutive failures required to transition Closed → Open.
-- `half_open_calls` counts probes in the HalfOpen state.
-- `fallback` optionally names an alternative kernel to call when Open.
-- `total_trips` records how many times the breaker has opened.
+### Closed — The Happy Path
 
-State transitions:
+In the **Closed** state, the circuit is intact and traffic flows freely. Every call to the kernel is allowed through as `CallDecision::Execute`. Successes are counted, but more importantly, *consecutive* failures are tracked. If a kernel fails `threshold` times in a row, the breaker snaps **Open**. A single success resets the consecutive counter to zero, so intermittent hiccups do not cause unnecessary flapping.
 
-- **Closed → Open**: Consecutive failures reach threshold, or a HalfOpen probe fails.
-- **Open → HalfOpen**: An external healing process calls `try_half_open()` after a cooldown.
-- **HalfOpen → Closed**: A probe succeeds.
-- **HalfOpen → Open**: A probe fails.
+### Open — Fail-Fast Protection
 
-### CallDecision
+Once the breaker is **Open**, the kernel is considered unhealthy. Further calls are rejected immediately with `CallDecision::Rejected`, preventing wasted GPU cycles. If you configured a fallback kernel (for example, a slower but reliable CPU implementation), the breaker returns `CallDecision::Fallback` instead. The Open state is sticky: it persists until an external timer or orchestrator decides it is time to probe recovery.
 
-When a caller asks `allow_call()`, the breaker returns one of four decisions:
+### HalfOpen — Cautious Probing
 
-- `Execute(name)` — Run the primary kernel.
-- `Fallback(name)` — Run the fallback kernel (if configured).
-- `Probe(name)` — Run a limited probe while HalfOpen.
-- `Rejected` — Fail fast; no fallback available.
+When the orchestrator invokes `try_half_open()`, the breaker enters the **HalfOpen** state. A limited number of calls are admitted as `CallDecision::Probe`. If a probed call succeeds, the breaker closes immediately and normal operation resumes. If it fails even once, the breaker trips back to Open. This tight feedback loop ensures that recovery is validated with real traffic before the full fire-hose is re-opened.
 
-### FleetBreakerState
-
-`FleetBreakerState` aggregates breaker states for all kernels on a node. Nodes can merge states using a CRDT rule where `Open` overrides `HalfOpen`, and `HalfOpen` overrides `Closed`. This produces **monotonic failure propagation**: once the fleet learns a kernel is failing, that knowledge cannot be accidentally overwritten by a node that has not yet observed the failure.
-
-## Experiments
-
-The test suite encodes the following claims:
-
-```rust
-#[test]
-fn test_trips_on_threshold() {
-    // Three consecutive failures trip Closed → Open.
-}
-
-#[test]
-fn test_fallback_on_open() {
-    // Open state routes to fallback kernel when configured.
-}
-
-#[test]
-fn test_half_open_success_closes() {
-    // A successful probe in HalfOpen returns the breaker to Closed.
-}
-
-#[test]
-fn test_crdt_merge_propagates_open() {
-    // Fleet-wide merge propagates Open state across nodes.
-}
-```
-
-A larger experiment: simulate a 32-node fleet where one kernel has a 1% failure rate under a specific input distribution. Measure:
-
-- Mean time to trip across the fleet.
-- False-trip rate when failure rate is actually zero.
-- Recovery latency under `try_half_open()` with exponentially increasing cooldown.
-- Bandwidth saved by CRDT propagation vs. broadcasting every health update.
-
-## Applications
-
-- **Kernel-level fault isolation**: Prevent a buggy attention kernel from repeatedly crashing the host process.
-- **Graceful degradation**: Route failed GPU kernels to CPU fallback implementations.
-- **Fleet-wide outage containment**: One node observes a driver-level failure; all nodes stop calling the affected kernel within milliseconds.
-- **Integration with `oxide-canary`**: Canary failures should trip breakers automatically to protect the baseline.
-- **Integration with `oxide-fleet`**: The fleet coordinator can avoid assigning work to kernels marked Open on a given agent.
-
-## Open Questions
-
-1. **Threshold calibration**: Should thresholds be static per kernel, learned from historical failure rates, or adaptive to fleet-wide stress?
-2. **Half-open timing**: Is exponential backoff the right cooldown model, or should recovery be driven by explicit health checks?
-3. **Fallback fidelity**: When a GPU kernel falls back to CPU, how do we preserve numerical equivalence for scientific computing workloads?
-4. **CRDT partition tolerance**: During a network partition, can nodes on either side make conflicting breaker decisions that harm convergence?
-
-## Cross-Links
-
-- [SuperInstance agent-knowledge / FAULT-TOLERANCE.md](https://github.com/SuperInstance/agent-knowledge/blob/main/FAULT-TOLERANCE.md) — Theoretical foundations for failure containment.
-- [SuperInstance agent-knowledge / TERNARY-NUMBERS.md](https://github.com/SuperInstance/agent-knowledge/blob/main/TERNARY-NUMBERS.md) — Ternary framing of Closed/HalfOpen/Open.
-- [SuperInstance agent-knowledge / AGENT-TO-AGENT-PROTOCOL.md](https://github.com/SuperInstance/agent-knowledge/blob/main/AGENT-TO-AGENT-PROTOCOL.md) — Protocol layer beneath CRDT sync.
-- `oxide-fleet` — Uses breaker state in work assignment decisions.
-- `oxide-canary` — Generates kernel version changes that may trip breakers.
-- `oxide-constructs` — Supplies the kernels being protected.
+---
 
 ## Quick Start
 
+Add the crate to your `Cargo.toml`:
+
+```toml
+[dependencies]
+oxide-circuit-breaker = "0.1"
+```
+
+Then protect a kernel:
+
 ```rust
-use oxide_circuit_breaker::{KernelBreaker, BreakerState, CallDecision, FleetBreakerState};
+use oxide_circuit_breaker::{KernelBreaker, CallDecision};
 
-let mut breaker = KernelBreaker::with_fallback("attention", 3, "attention_cpu");
+fn main() {
+    // Trip after 3 consecutive failures; fallback to a CPU kernel
+    let mut breaker = KernelBreaker::with_fallback("flash_attention", 3, "attention_cpu");
 
-// Simulate failures.
-breaker.record_failure();
-breaker.record_failure();
-breaker.record_failure();
-assert_eq!(breaker.state, BreakerState::Open);
-
-match breaker.allow_call() {
-    CallDecision::Fallback(name) => println!("Routing to fallback: {}", name),
-    _ => panic!("Expected fallback"),
+    match breaker.allow_call() {
+        CallDecision::Execute(kernel) => {
+            // Run the fast GPU kernel
+            let ok = run_kernel(&kernel);
+            if ok { breaker.record_success(); } else { breaker.record_failure(); }
+        }
+        CallDecision::Fallback(kernel) => {
+            // The fast path is down; use the reliable fallback
+            run_kernel(&kernel);
+            // Fallbacks do not automatically record success/failure;
+            // you decide whether to heal the breaker based on fallback outcome.
+        }
+        CallDecision::Probe(kernel) => {
+            // Half-open: cautiously try the real kernel again
+            let ok = run_kernel(&kernel);
+            if ok { breaker.record_success(); } else { breaker.record_failure(); }
+        }
+        CallDecision::Rejected => {
+            // No fallback configured; drop or queue the work
+            eprintln!("Kernel circuit is open; request rejected.");
+        }
+    }
 }
+```
 
-// Simulate fleet-wide propagation.
+---
+
+## Fleet-Wide Awareness with CRDTs
+
+A single-node circuit breaker is useful, but a GPU cluster is a distributed system. If `gpu-0` discovers that `custom_reduce_v2` is buggy, `gpu-1` through `gpu-7` should not have to rediscover that fact by crashing themselves.
+
+`FleetBreakerState` solves this with a lightweight CRDT merge. Each node maintains a local map of kernel names to breaker states. When nodes gossip (over your transport of choice—RDMA, NCCL, or even a sidecar HTTP API), they exchange `FleetBreakerState` structs and call `merge()`:
+
+```rust
+use oxide_circuit_breaker::{FleetBreakerState, BreakerState};
+
 let mut node_a = FleetBreakerState::new("gpu-0");
 let mut node_b = FleetBreakerState::new("gpu-1");
-node_b.update("attention", BreakerState::Open);
+
+// Node B observes a failure and marks the kernel Open
+node_b.update("bad_kernel", BreakerState::Open);
+
+// After gossip, Node A merges Node B's state
 node_a.merge(&node_b);
-assert_eq!(node_a.kernel_states["attention"], BreakerState::Open);
+
+assert_eq!(node_a.kernel_states["bad_kernel"], BreakerState::Open);
 ```
+
+The merge logic is monotonic and conflict-free: **Open overrides HalfOpen, and either overrides Closed**. Versions are advanced with a max-plus-one strategy, so the data structure is idempotent and commutative. You can merge the same state twice, or merge out-of-order, and the result is always convergent.
+
+---
+
+## API Highlights
+
+| Type / Method | Purpose |
+|---------------|---------|
+| `KernelBreaker::new(name, threshold)` | Create a breaker for a kernel with a failure threshold. |
+| `KernelBreaker::with_fallback(name, threshold, fallback)` | Same, but route to a fallback kernel when Open. |
+| `allow_call()` | Decide whether to execute, fallback, probe, or reject. |
+| `record_success()` | Notify the breaker of a successful kernel execution. |
+| `record_failure()` | Notify the breaker of a failure; may trip Open. |
+| `try_half_open()` | Transition Open → HalfOpen to test recovery. |
+| `failure_rate()` | Historical failure rate across all calls. |
+| `FleetBreakerState::merge(other)` | CRDT merge for distributed state convergence. |
+
+---
+
+## Design Philosophy
+
+1. **Zero async, zero allocations on the hot path.** `allow_call()`, `record_success()`, and `record_failure()` are simple enum matches and integer increments. They will not disturb your CUDA streams.
+2. **Explicit over magical.** The library does not spawn threads, start timers, or call into drivers. You control when (and if) the breaker transitions from Open to HalfOpen.
+3. **Fleet-first.** The CRDT layer means the breaker is useful in single-process tools *and* multi-node training jobs without changing the API.
+
+---
+
+## Testing
+
+The crate ships with exhaustive unit tests covering threshold trips, fallback routing, consecutive-failure resets, half-open probes, and CRDT idempotency:
+
+```bash
+cargo test
+```
+
+All tests run without a GPU and complete in milliseconds.
+
+---
+
+## Relationship to SuperInstance
+
+`oxide-circuit-breaker` is developed as a foundational resilience primitive for the [SuperInstance](https://github.com/SuperInstance/SuperInstance) project. SuperInstance provides orchestration, scheduling, and observability for large-scale GPU clusters; this crate handles the narrow but critical responsibility of keeping individual kernels from taking down a job. If you are building GPU infrastructure in Rust, we encourage you to explore the broader SuperInstance ecosystem.
+
+---
+
+## License
+
+Licensed under the Apache License, Version 2.0. See LICENSE for details.
+
+---
+
+*Built with 🦀 for the next generation of GPU infrastructure.*
